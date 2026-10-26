@@ -718,7 +718,7 @@ async fn open_database(location: &str) -> Result<turso::Database, turso::Error> 
     }
 
     turso::Builder::new_local(location)
-        .experimental_multiprocess_wal(true)
+        .experimental_multiprocess_wal(!cfg!(windows))
         .build()
         .await
 }
