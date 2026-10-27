@@ -209,6 +209,11 @@ impl RuntimeConfig for CubeClRuntimeConfig {
             }
         }
 
+        #[cfg(persistence)]
+        if let Some(enabled) = env_bool("CUBECL_COMPILATION_CACHE") {
+            self.compilation.cache = enabled;
+        }
+
         if let Some(enabled) = env_bool("CUBECL_AUTOTUNE_CACHE") {
             self.autotune.disable_cache = !enabled;
         }
