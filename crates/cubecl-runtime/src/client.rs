@@ -331,6 +331,29 @@ impl Client {
         self.stream_id = Some(stream_id);
     }
 
+    /// pyre: like [`read_async`](Self::read_async), but the read is queued to the device thread without
+    /// waiting for it to drain the work queued before it; the copies and their fence are recorded when the
+    /// device thread reaches the request, so the result is the same. Awaiting the future blocks until then.
+    pub fn read_async_nb(&self, handles: Vec<Handle>) -> DynFut<Result<Vec<Bytes>, ServerError>> {
+        let descriptors: Vec<CopyDescriptor> = handles
+            .into_iter()
+            .map(|handle| {
+                let shape: Shape = [handle.size_in_used() as usize].into();
+                CopyDescriptor::new(handle.binding(), shape, [1].into(), 1)
+            })
+            .collect();
+        if let Some(err) = descriptors.iter().find_map(|d| self.local(&d.handle).err()) {
+            return Box::pin(core::future::ready(Err(err)));
+        }
+        let stream_id = self.stream_id();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.device.submit(move |server| {
+            let _ = tx.send(server.read(descriptors, stream_id));
+        });
+        self.device.flush_queue();
+        Box::pin(async move { rx.recv().expect("device thread dropped a queued read").await })
+    }
+
     fn do_read(&self, descriptors: Vec<CopyDescriptor>) -> DynFut<Result<Vec<Bytes>, ServerError>> {
         if let Some(err) = descriptors
             .iter()
