@@ -222,7 +222,8 @@ fn dump_ptx(kernel_id: &KernelId, ptx: &[c_char]) {
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
     // ...and is long enough to blow past NAME_MAX on its own.
-    let name = &name[name.len().saturating_sub(180)..];
+    let h = { use std::hash::{Hash, Hasher}; let mut s = std::collections::hash_map::DefaultHasher::new(); name.hash(&mut s); s.finish() };
+    let name = format!("{h:016x}_{}", &name[name.len().saturating_sub(160)..]);
 
     // SAFETY: the PTX handed to the driver is a null-terminated C string.
     let text = unsafe { CStr::from_ptr(ptx.as_ptr()) };
