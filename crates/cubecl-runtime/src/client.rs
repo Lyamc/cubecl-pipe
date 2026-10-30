@@ -1519,6 +1519,26 @@ impl Client {
             .unwrap_or_resume()
     }
 
+    /// pyre (PYRE_QN_PIPE): page-locked host memory (see `Server::pyre_host_pinned`); host address.
+    pub fn pyre_host_pinned(&self, bytes: usize) -> Result<usize, ServerError> {
+        self.device.submit_blocking(move |server| server.pyre_host_pinned(bytes)).unwrap_or_resume()
+    }
+
+    /// pyre (PYRE_QN_PIPE=1): enqueue a stream-ordered host gate + pinned->device copy on this client's stream
+    /// (see `Server::pyre_host_gate`). Non-blocking. `wait` must return in bounded time.
+    ///
+    /// # Safety
+    /// `src` must be a pyre_host_pinned range of >= `len` bytes that stays valid and is not rewritten
+    /// until the copy has run (i.e. until a later sync/read on this stream).
+    pub unsafe fn pyre_host_gate(&self, wait: Box<dyn FnOnce() + Send>, src: usize, len: usize, dst: &Handle) {
+        let stream_id = self.stream_id();
+        let b = dst.clone().binding();
+        self.expect_local(&b);
+        self.device.submit(move |server| {
+            if let Err(e) = server.pyre_host_gate(stream_id, wait, src, len, b) { log::error!("pyre_host_gate: {e}"); }
+        });
+    }
+
     /// pyre: hand the queued commands to the device thread without waiting for them to run
     /// (a non-blocking [lush](Self::flush): the device thread launches them in order).
     pub fn flush_queue(&self) {

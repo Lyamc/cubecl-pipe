@@ -1022,6 +1022,23 @@ pub trait ServerCommunication {
     /// # Errors
     ///
     /// The default returns [`ServerError::NoDeviceTransport`].
+    /// pyre (PYRE_QN_PIPE): page-locked host memory the device can DMA from directly. Returns the host
+    /// address; the allocation lives until the process exits.
+    #[allow(unused_variables)]
+    fn pyre_host_pinned(&mut self, bytes: usize) -> Result<usize, ServerError> {
+        Err(ServerError::graph_state("pyre_host_pinned: unsupported backend"))
+    }
+
+    /// pyre (PYRE_QN_PIPE=1): a stream-ordered host gate. Enqueues on `stream_id` a host function that runs
+    /// `wait` (which must return in bounded time), then an async copy of `len` bytes from the pinned host
+    /// address `src` into `dst`. Work queued after it on the stream runs only after both. No device-side
+    /// spinning: the driver holds the stream while `wait` runs (design after Strata's mapped-flag verify
+    /// pipeline, github.com/Niko1221/Strata, MIT; reimplemented, no Strata code).
+    #[allow(unused_variables)]
+    fn pyre_host_gate(&mut self, stream_id: StreamId, wait: Box<dyn FnOnce() + Send>, src: usize, len: usize, dst: BufferBinding) -> Result<(), ServerError> {
+        Err(ServerError::graph_state("pyre_host_gate: unsupported backend"))
+    }
+
     #[allow(unused_variables)]
     fn sync_collective(&mut self, stream_id: StreamId) -> Result<(), ServerError> {
         Err(ServerError::no_device_transport(Collective::SyncCollective))

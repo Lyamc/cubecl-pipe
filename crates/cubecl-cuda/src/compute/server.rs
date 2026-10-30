@@ -649,6 +649,42 @@ impl ServerCommunication for CudaServer {
         })
     }
 
+    fn pyre_host_pinned(&mut self, bytes: usize) -> Result<usize, ServerError> {
+        self.unsafe_set_current();
+        let mut p: *mut core::ffi::c_void = core::ptr::null_mut();
+        // SAFETY: plain page-locked allocation in this server's (current) context; never freed (process lifetime).
+        let r = unsafe { cudarc::driver::sys::cuMemHostAlloc(&mut p, bytes.max(64), cudarc::driver::sys::CU_MEMHOSTALLOC_PORTABLE) };
+        if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS || p.is_null() { return Err(ServerError::graph_state(format!("cuMemHostAlloc({bytes}) failed: {r:?}"))); }
+        Ok(p as usize)
+    }
+
+    fn pyre_host_gate(&mut self, stream_id: StreamId, wait: Box<dyn FnOnce() + Send>, src: usize, len: usize, dst: BufferBinding) -> Result<(), ServerError> {
+        unsafe extern "C" fn tramp(u: *mut core::ffi::c_void) {
+            // SAFETY: `u` is the Box leaked below, consumed exactly once here. A panic must not unwind into the driver.
+            let f = unsafe { Box::from_raw(u as *mut Box<dyn FnOnce() + Send>) };
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || f()));
+        }
+        let mut command = self.command(stream_id, [&dst].into_iter())?;
+        let res = command.resource(dst.clone())?;
+        if (len as u64) > res.size { return Err(ServerError::graph_state(format!("pyre_host_gate: {len} bytes into a {}-byte buffer", res.size))); }
+        let stream = command.stream().sys;
+        drop(command);
+        let ud = Box::into_raw(Box::new(wait)) as *mut core::ffi::c_void;
+        // SAFETY: valid stream; the host function makes no CUDA calls (it only waits on host state, bounded).
+        let r = unsafe { cudarc::driver::sys::cuLaunchHostFunc(stream, Some(tramp), ud) };
+        if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            // not enqueued: run it here so the waiter's bookkeeping completes, then report
+            unsafe { tramp(ud) };
+            return Err(ServerError::graph_state(format!("cuLaunchHostFunc failed: {r:?}")));
+        }
+        if len > 0 {
+            // SAFETY: `src` is a pinned host range of >= len bytes (pyre_host_pinned), `res.ptr` a live device range of >= len.
+            let r = unsafe { cudarc::driver::sys::cuMemcpyHtoDAsync_v2(res.ptr, src as *const core::ffi::c_void, len, stream) };
+            if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS { return Err(ServerError::graph_state(format!("cuMemcpyHtoDAsync failed: {r:?}"))); }
+        }
+        Ok(())
+    }
+
     fn sync_collective(&mut self, stream_id: StreamId) -> Result<(), ServerError> {
         let mut command = self.command_no_inputs(stream_id)?;
         let stream = command.stream().sys;
