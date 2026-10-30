@@ -1524,13 +1524,24 @@ impl Client {
         self.device.submit_blocking(move |server| server.pyre_host_pinned(bytes)).unwrap_or_resume()
     }
 
+    /// pyre (PYRE_QN_PIPE=2): enqueue the bounded device wait on a mapped host flag (see `Server::pyre_wait_flag`). Non-blocking.
+    ///
+    /// # Safety
+    /// `flag`/`err` must be mapped `pyre_host_pinned` addresses valid for the life of the process.
+    pub unsafe fn pyre_wait_flag(&self, flag: usize, target: u32, timeout_ns: u64, err: usize) {
+        let stream_id = self.stream_id();
+        self.device.submit(move |server| {
+            if let Err(e) = server.pyre_wait_flag(stream_id, flag, target, timeout_ns, err) { log::error!("pyre_wait_flag: {e}"); }
+        });
+    }
+
     /// pyre (PYRE_QN_PIPE=1): enqueue a stream-ordered host gate + pinned->device copy on this client's stream
     /// (see `Server::pyre_host_gate`). Non-blocking. `wait` must return in bounded time.
     ///
     /// # Safety
     /// `src` must be a pyre_host_pinned range of >= `len` bytes that stays valid and is not rewritten
     /// until the copy has run (i.e. until a later sync/read on this stream).
-    pub unsafe fn pyre_host_gate(&self, wait: Box<dyn FnOnce() + Send>, src: usize, len: usize, dst: &Handle) {
+    pub unsafe fn pyre_host_gate(&self, wait: Option<Box<dyn FnOnce() + Send>>, src: usize, len: usize, dst: &Handle) {
         let stream_id = self.stream_id();
         let b = dst.clone().binding();
         self.expect_local(&b);

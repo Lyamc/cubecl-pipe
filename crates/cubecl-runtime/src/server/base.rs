@@ -1029,13 +1029,22 @@ pub trait ServerCommunication {
         Err(ServerError::graph_state("pyre_host_pinned: unsupported backend"))
     }
 
+    /// pyre (PYRE_QN_PIPE=2): enqueue a one-thread kernel that waits, BOUNDED, until the u32 at the mapped
+    /// host address `flag` is >= `target`: __nanosleep backoff (64 ns doubling to 8 us), gives up after
+    /// `timeout_ns` of %globaltimer and then stores 1 to the mapped u32 at `err`. Both addresses must come from
+    /// `pyre_host_pinned` (mapped). Keep `timeout_ns` far below the WDDM TDR limit (2 s).
+    #[allow(unused_variables)]
+    fn pyre_wait_flag(&mut self, stream_id: StreamId, flag: usize, target: u32, timeout_ns: u64, err: usize) -> Result<(), ServerError> {
+        Err(ServerError::graph_state("pyre_wait_flag: unsupported backend"))
+    }
+
     /// pyre (PYRE_QN_PIPE=1): a stream-ordered host gate. Enqueues on `stream_id` a host function that runs
     /// `wait` (which must return in bounded time), then an async copy of `len` bytes from the pinned host
     /// address `src` into `dst`. Work queued after it on the stream runs only after both. No device-side
     /// spinning: the driver holds the stream while `wait` runs (design after Strata's mapped-flag verify
     /// pipeline, github.com/Niko1221/Strata, MIT; reimplemented, no Strata code).
     #[allow(unused_variables)]
-    fn pyre_host_gate(&mut self, stream_id: StreamId, wait: Box<dyn FnOnce() + Send>, src: usize, len: usize, dst: BufferBinding) -> Result<(), ServerError> {
+    fn pyre_host_gate(&mut self, stream_id: StreamId, wait: Option<Box<dyn FnOnce() + Send>>, src: usize, len: usize, dst: BufferBinding) -> Result<(), ServerError> {
         Err(ServerError::graph_state("pyre_host_gate: unsupported backend"))
     }
 

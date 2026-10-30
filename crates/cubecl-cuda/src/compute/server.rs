@@ -653,12 +653,57 @@ impl ServerCommunication for CudaServer {
         self.unsafe_set_current();
         let mut p: *mut core::ffi::c_void = core::ptr::null_mut();
         // SAFETY: plain page-locked allocation in this server's (current) context; never freed (process lifetime).
-        let r = unsafe { cudarc::driver::sys::cuMemHostAlloc(&mut p, bytes.max(64), cudarc::driver::sys::CU_MEMHOSTALLOC_PORTABLE) };
+        let r = unsafe { cudarc::driver::sys::cuMemHostAlloc(&mut p, bytes.max(64), cudarc::driver::sys::CU_MEMHOSTALLOC_PORTABLE | cudarc::driver::sys::CU_MEMHOSTALLOC_DEVICEMAP) };
         if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS || p.is_null() { return Err(ServerError::graph_state(format!("cuMemHostAlloc({bytes}) failed: {r:?}"))); }
         Ok(p as usize)
     }
 
-    fn pyre_host_gate(&mut self, stream_id: StreamId, wait: Box<dyn FnOnce() + Send>, src: usize, len: usize, dst: BufferBinding) -> Result<(), ServerError> {
+    fn pyre_wait_flag(&mut self, stream_id: StreamId, flag: usize, target: u32, timeout_ns: u64, err: usize) -> Result<(), ServerError> {
+        // Design after Strata's wait_flag_ge (github.com/Niko1221/Strata, MIT); reimplemented with a hard time bound.
+        const SRC: &str = r#"extern "C" __global__ void pyre_wait_flag(volatile unsigned int* f, unsigned int target, unsigned long long tmo, volatile unsigned int* err) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  unsigned long long t0, t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+  unsigned int ns = 64;
+  while (*f < target) {
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    if (t - t0 > tmo) { *err = 1u; __threadfence_system(); return; }
+    __nanosleep(ns); if (ns < 8192u) ns <<= 1;
+  }
+  __threadfence();
+}"#;
+        static FUNC: std::sync::OnceLock<Result<usize, String>> = std::sync::OnceLock::new();
+        self.unsafe_set_current();
+        let func = FUNC.get_or_init(|| {
+            let opts = cudarc::nvrtc::CompileOptions { arch: Some("compute_75"), ..Default::default() };
+            let ptx = cudarc::nvrtc::compile_ptx_with_opts(SRC, opts).map_err(|e| format!("nvrtc: {e:?}"))?;
+            let src = std::ffi::CString::new(ptx.to_src()).map_err(|e| format!("{e}"))?;
+            let mut m: cudarc::driver::sys::CUmodule = core::ptr::null_mut();
+            // SAFETY: NUL-terminated PTX text; the module is kept for the process lifetime.
+            let r = unsafe { cudarc::driver::sys::cuModuleLoadData(&mut m, src.as_ptr() as *const core::ffi::c_void) };
+            if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS { return Err(format!("cuModuleLoadData {r:?}")); }
+            let mut f: cudarc::driver::sys::CUfunction = core::ptr::null_mut();
+            let name = std::ffi::CString::new("pyre_wait_flag").unwrap();
+            let r = unsafe { cudarc::driver::sys::cuModuleGetFunction(&mut f, m, name.as_ptr()) };
+            if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS { return Err(format!("cuModuleGetFunction {r:?}")); }
+            Ok(f as usize)
+        });
+        let f = match func { Ok(f) => *f as cudarc::driver::sys::CUfunction, Err(e) => return Err(ServerError::graph_state(e.clone())) };
+        let dev = |h: usize| -> Result<u64, ServerError> { let mut d: cudarc::driver::sys::CUdeviceptr = 0;
+            // SAFETY: `h` is a DEVICEMAP pinned allocation (pyre_host_pinned).
+            let r = unsafe { cudarc::driver::sys::cuMemHostGetDevicePointer_v2(&mut d, h as *mut core::ffi::c_void, 0) };
+            if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS { return Err(ServerError::graph_state(format!("cuMemHostGetDevicePointer {r:?}"))); } Ok(d) };
+        let (mut df, mut t, mut tmo, mut de) = (dev(flag)?, target, timeout_ns.min(200_000_000), dev(err)?);
+        let mut command = self.command_no_inputs(stream_id)?;
+        let stream = command.stream().sys;
+        drop(command);
+        let mut params: [*mut core::ffi::c_void; 4] = [&mut df as *mut _ as _, &mut t as *mut _ as _, &mut tmo as *mut _ as _, &mut de as *mut _ as _];
+        // SAFETY: one block of 32 threads, args match the kernel signature, valid stream.
+        let r = unsafe { cudarc::driver::sys::cuLaunchKernel(f, 1, 1, 1, 32, 1, 1, 0, stream, params.as_mut_ptr(), core::ptr::null_mut()) };
+        if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS { return Err(ServerError::graph_state(format!("cuLaunchKernel(pyre_wait_flag) {r:?}"))); }
+        Ok(())
+    }
+
+    fn pyre_host_gate(&mut self, stream_id: StreamId, wait: Option<Box<dyn FnOnce() + Send>>, src: usize, len: usize, dst: BufferBinding) -> Result<(), ServerError> {
         unsafe extern "C" fn tramp(u: *mut core::ffi::c_void) {
             // SAFETY: `u` is the Box leaked below, consumed exactly once here. A panic must not unwind into the driver.
             let f = unsafe { Box::from_raw(u as *mut Box<dyn FnOnce() + Send>) };
@@ -669,6 +714,7 @@ impl ServerCommunication for CudaServer {
         if (len as u64) > res.size { return Err(ServerError::graph_state(format!("pyre_host_gate: {len} bytes into a {}-byte buffer", res.size))); }
         let stream = command.stream().sys;
         drop(command);
+        if let Some(wait) = wait {
         let ud = Box::into_raw(Box::new(wait)) as *mut core::ffi::c_void;
         // SAFETY: valid stream; the host function makes no CUDA calls (it only waits on host state, bounded).
         let r = unsafe { cudarc::driver::sys::cuLaunchHostFunc(stream, Some(tramp), ud) };
@@ -676,6 +722,7 @@ impl ServerCommunication for CudaServer {
             // not enqueued: run it here so the waiter's bookkeeping completes, then report
             unsafe { tramp(ud) };
             return Err(ServerError::graph_state(format!("cuLaunchHostFunc failed: {r:?}")));
+        }
         }
         if len > 0 {
             // SAFETY: `src` is a pinned host range of >= len bytes (pyre_host_pinned), `res.ptr` a live device range of >= len.
