@@ -16,6 +16,11 @@ pub trait Fence: Sized {
     /// The fault the wait reveals, when the stream itself failed.
     fn wait(self) -> Result<(), ServerError>;
 
+    /// Whether the device already signalled this fence, without blocking. `false` when unknown.
+    fn is_done(&self) -> bool {
+        false
+    }
+
     /// [`wait`](Self::wait).
     ///
     /// What the drop queue needs: it only has to know the device is done
@@ -152,6 +157,20 @@ impl<F: Fence> PendingDropQueue<F> {
         // the stream, which an open capture window cannot tolerate.
         if self.pending.is_empty() && self.staged.is_empty() {
             return;
+        }
+
+        // CUBECL_DROPQ_ASYNC=1: when the previous batch's fence has not been passed yet, keep the
+        // current batch staged (still held) and return instead of blocking the host until the device
+        // catches up; a later flush rotates it. Bounded: a backlog of 4096 holds falls back to the wait.
+        #[cfg(feature = "std")]
+        {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *ON.get_or_init(|| std::env::var("CUBECL_DROPQ_ASYNC").map(|v| v == "1").unwrap_or(false))
+                && self.staged.len() < 4096
+                && self.fence.as_ref().is_some_and(|f| !f.is_done())
+            {
+                return;
+            }
         }
 
         // Sync the fence from the previous flush and free the bytes it was

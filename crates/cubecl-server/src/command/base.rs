@@ -307,6 +307,14 @@ impl<'a, D: Driver> Command<'a, D> {
         let handle = stream
             .host_memory()
             .reserve(size as u64, update, failures)
+            .map_err(|e| {
+                #[cfg(feature = "std")]
+                {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| std::eprintln!("cubecl: pinned reserve of {size} bytes failed: {e:?}"));
+                }
+                e
+            })
             .ok()?;
 
         let binding = MemoryHandle::binding(handle);
@@ -463,6 +471,18 @@ impl<'a, D: Driver> Command<'a, D> {
         let layout = CopyLayout::of(&shape, &strides, elem_size)?;
         let resource = self.resource(binding)?;
         let staging = Staging::of(size, data.property());
+        #[cfg(feature = "std")]
+        {
+            // CUBECL_STAGE_LOG=1: every 2000 writes, how many bytes were restaged through the pinned pool vs copied directly
+            use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+            static N: AtomicU64 = AtomicU64::new(0); static RS: AtomicU64 = AtomicU64::new(0); static DI: AtomicU64 = AtomicU64::new(0); static NS: AtomicU64 = AtomicU64::new(0);
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *ON.get_or_init(|| std::env::var("CUBECL_STAGE_LOG").is_ok()) {
+                if staging.through_pinned { RS.fetch_add(size as u64, Relaxed); } else { DI.fetch_add(size as u64, Relaxed); }
+                if size >= 65536 { NS.fetch_add(1, Relaxed); }
+                if N.fetch_add(1, Relaxed) % 2000 == 1999 { static T0: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None); let el = { let mut g = T0.lock().unwrap(); let e = g.map(|t| t.elapsed().as_secs_f64() * 1e3).unwrap_or(0.0); *g = Some(std::time::Instant::now()); e }; std::eprint!("[2000 writes in {el:.0} ms] "); std::eprintln!("cubecl stage: restaged {:.1} MB direct {:.1} MB, {} large writes, {:.1} ms in the driver copy call", RS.swap(0, Relaxed) as f64 / 1e6, DI.swap(0, Relaxed) as f64 / 1e6, NS.swap(0, Relaxed), STAGE_NS.swap(0, Relaxed) as f64 / 1e6); }
+            }
+        }
 
         let data = match staging.through_pinned {
             true => {
@@ -486,7 +506,11 @@ impl<'a, D: Driver> Command<'a, D> {
         // SAFETY: `resource` is a live device allocation, `data` is a valid
         // host buffer, and either the drop queue or the capture window below
         // keeps it alive for as long as the device reads it.
+        #[cfg(feature = "std")]
+        let t_cp = std::time::Instant::now();
         unsafe { D::copy_to_device(&resource, &layout, &data, current)? };
+        #[cfg(feature = "std")]
+        if size >= 65536 && std::env::var_os("CUBECL_STAGE_LOG").is_some() { stage_ns(t_cp.elapsed().as_nanos() as u64); }
 
         if current.capturing().is_recording() {
             // A copy recorded into a graph is not executed now but re-read on
@@ -641,3 +665,8 @@ impl<D: Driver> Command<'_, D> {
             .relocate(&mut copier, reason, failures);
     }
 }
+
+#[cfg(feature = "std")]
+static STAGE_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "std")]
+fn stage_ns(n: u64) { STAGE_NS.fetch_add(n, core::sync::atomic::Ordering::Relaxed); }

@@ -63,6 +63,11 @@ impl EventApi for Cuda {
         named("cuEventRecord", unsafe { event::record(event.0, stream) })
     }
 
+    fn event_done(event: &Self::Event) -> bool {
+        // SAFETY: the event is live for as long as `event`.
+        matches!(unsafe { cudarc::driver::sys::cuEventQuery(event.0) }, CUresult::CUDA_SUCCESS)
+    }
+
     fn event_wait(event: &Self::Event) -> Result<(), DriverError> {
         // SAFETY: the event is live for as long as `event`.
         named("cuEventSynchronize", unsafe { event::synchronize(event.0) })

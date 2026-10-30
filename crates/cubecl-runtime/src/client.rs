@@ -917,7 +917,14 @@ impl Client {
 
         let stagings = match stagings {
             Ok(val) => val,
-            Err(_) => return,
+            Err(_e) => {
+                #[cfg(feature = "std")]
+                {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| std::eprintln!("cubecl: staging failed: {_e:?}"));
+                }
+                return;
+            }
         };
 
         to_be_updated

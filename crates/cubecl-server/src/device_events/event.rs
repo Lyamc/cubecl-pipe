@@ -38,6 +38,11 @@ impl<A: EventApi> Event<A> {
     /// # Errors
     ///
     /// [`DriverError`], the fault the wait revealed on the stream.
+    /// Whether the device has passed this event, without blocking.
+    pub fn done(&self) -> bool {
+        A::event_done(&self.sys)
+    }
+
     pub fn wait(&self) -> Result<(), DriverError> {
         A::event_wait(&self.sys)
     }

@@ -100,4 +100,11 @@ impl<A: EventApi> drop_queue::Fence for EventFence<A> {
     fn wait(self) -> Result<(), ServerError> {
         self.wait_sync()
     }
+    fn is_done(&self) -> bool {
+        match &self.event {
+            Ok(Some(event)) => event.done(),
+            Ok(None) => true,
+            Err(_) => false,
+        }
+    }
 }

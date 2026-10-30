@@ -70,6 +70,10 @@ pub trait EventApi: Send + Sync + 'static {
     /// event was recorded into.
     fn event_wait(event: &Self::Event) -> Result<(), DriverError>;
 
+    /// Whether the event has completed, without blocking. The default answers "not known yet", which keeps
+    /// every caller on its blocking path.
+    fn event_done(_event: &Self::Event) -> bool { false }
+
     /// Device time from `start` to `end`. Both must have been reached.
     ///
     /// Implementations clamp a negative reading to zero rather than trusting
