@@ -143,9 +143,13 @@ impl SlicedPool {
         let handle = self
             .pages
             .iter_mut()
-            .filter(|(page, _)| !page.is_guarded())
+            .filter(|(page, _)| !page.is_guarded() || guard_carve())
             .find_map(|(page, _)| {
-                page.coalesce(failures);
+                // a guarded page keeps its slices in place (no coalescing), but with CUBECL_GUARD_CARVE=1 its free
+                // slices may still be carved: the graph owner keeps every buffer the graph touches alive
+                if !page.is_guarded() {
+                    page.coalesce(failures);
+                }
                 page.try_reserve(size)
             });
         if handle.is_some() {
@@ -385,4 +389,10 @@ impl Display for SlicedPool {
 
         f.write_fmt(format_args!("\n{}\n", self.get_memory_usage()))
     }
+}
+
+/// Whether free slices on guarded pages may be carved (CUBECL_GUARD_CARVE=1).
+fn guard_carve() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| std::env::var("CUBECL_GUARD_CARVE").map(|v| v == "1").unwrap_or(false))
 }
