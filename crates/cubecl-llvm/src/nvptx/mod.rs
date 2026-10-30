@@ -1,6 +1,7 @@
 //! NVPTX target.
 
 pub mod abi;
+pub(crate) mod asm_ops;
 pub(crate) mod address;
 pub mod barrier;
 pub mod builtins;

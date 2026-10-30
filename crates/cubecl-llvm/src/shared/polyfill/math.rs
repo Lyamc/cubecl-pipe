@@ -25,6 +25,19 @@ use cubecl_core::{
 
 #[op_interface_impl]
 impl LowerOp for Dp4aOp {
+    // NVPTX has the instruction: `nvptx::asm_ops` emits it, so the polyfill runs on the other targets only
+    fn should_lower(&self, ctx: &Context) -> bool {
+        #[cfg(feature = "nvptx")]
+        {
+            use crate::target::CtxTarget;
+            if ctx.target() == crate::target::LlvmTarget::Nvptx {
+                return false;
+            }
+        }
+        let _ = ctx;
+        true
+    }
+
     fn lower(&self, scope: &Scope) -> Vec<Value> {
         let ctx = scope.ctx();
         vec![expand_dp4a_polyfill(
