@@ -1496,6 +1496,12 @@ impl Client {
             .unwrap_or_resume()
     }
 
+    /// pyre: hand the queued commands to the device thread without waiting for them to run
+    /// (a non-blocking [lush](Self::flush): the device thread launches them in order).
+    pub fn flush_queue(&self) {
+        self.device.flush_queue();
+    }
+
     /// Flush all outstanding commands.
     pub fn flush(&self) -> Result<(), ServerError> {
         let stream_id = self.stream_id();

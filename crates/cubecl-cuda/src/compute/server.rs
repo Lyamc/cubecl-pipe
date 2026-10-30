@@ -99,6 +99,11 @@ pub struct CudaServer {
 // SAFETY: `CudaServer` is only accessed from one thread at a time via the `DeviceHandle`,
 // which serializes all server access. The CUDA context, streams, and NCCL communicators
 // it manages are never shared across threads without synchronization.
+/// pyre: CUBECL_LAUNCH_LOG=1 prints the device-thread time spent in launch every 5000 launches
+struct LaunchTimer(Option<std::time::Instant>);
+impl LaunchTimer { fn new() -> Self { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); Self(if *ON.get_or_init(|| std::env::var("CUBECL_LAUNCH_LOG").is_ok()) { Some(std::time::Instant::now()) } else { None }) } }
+impl Drop for LaunchTimer { fn drop(&mut self) { if let Some(t) = self.0 { use core::sync::atomic::{AtomicU64, Ordering::Relaxed}; static NS: AtomicU64 = AtomicU64::new(0); static N: AtomicU64 = AtomicU64::new(0); static T0: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed); if N.fetch_add(1, Relaxed) % 5000 == 4999 { let w = { let mut g = T0.lock().unwrap(); let e = g.map(|x| x.elapsed().as_secs_f64() * 1e3).unwrap_or(0.0); *g = Some(std::time::Instant::now()); e }; std::eprintln!("cubecl launch: 5000 launches {:.1} ms in launch over {:.0} ms wall", NS.swap(0, Relaxed) as f64 / 1e6, w); } } } }
 unsafe impl Send for CudaServer {}
 
 impl Server for CudaServer {
@@ -190,6 +195,7 @@ impl Server for CudaServer {
         stream_id: StreamId,
         launch_mode: LaunchMode,
     ) {
+        let _lt = LaunchTimer::new();
         if launch_mode == LaunchMode::Queue {
             self.ctx.queue_kernel(kernel);
             return;
