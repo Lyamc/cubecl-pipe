@@ -1564,6 +1564,26 @@ impl Client {
         self.device.submit_blocking(move |server| server.pyre_wait_copy_from_mapped(stream_id, flag, target, timeout_ns, err, src, len, b)).unwrap_or_resume()
     }
 
+    /// pyre: `pyre_wait_copy_from_mapped` without the blocking round trip to the server: returns once submitted. On a
+    /// launch/validation error it logs and stores 1 to the u32 at `fail` (a host address valid for the process), so the
+    /// caller can detect it after the fact (the copy then did not happen).
+    ///
+    /// # Safety
+    /// As `pyre_wait_copy_from_mapped`; `fail` must point to a live, 4-byte aligned u32 for the life of the process.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn pyre_wait_copy_from_mapped_async(&self, flag: usize, target: u32, timeout_ns: u64, err: usize, src: usize, len: usize, dst: &Handle, fail: usize) {
+        let stream_id = self.stream_id();
+        let b = dst.clone().binding();
+        self.expect_local(&b);
+        self.device.submit(move |server| {
+            if let Err(e) = server.pyre_wait_copy_from_mapped(stream_id, flag, target, timeout_ns, err, src, len, b) {
+                log::error!("pyre_wait_copy_from_mapped_async: {e}");
+                // SAFETY: caller guarantees `fail` is a live aligned u32.
+                unsafe { core::ptr::write_volatile(fail as *mut u32, 1) };
+            }
+        });
+    }
+
     /// pyre (zero-copy): copy `len` bytes of `src` into mapped pinned host memory `dst` by a kernel, then store `value`
     /// to the mapped doorbell `flag` (see `Server::pyre_copy_to_mapped`). Returns once enqueued (validated); the host polls `flag`.
     ///
