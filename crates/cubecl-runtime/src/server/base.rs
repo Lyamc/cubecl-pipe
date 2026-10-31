@@ -1048,6 +1048,24 @@ pub trait ServerCommunication {
         Err(ServerError::graph_state("pyre_host_gate: unsupported backend"))
     }
 
+    /// pyre (zero-copy H2D): enqueue a kernel that (when `flag` != 0) waits BOUNDED until the mapped u32 at `flag` is >= `target`
+    /// (__nanosleep backoff <= 8 us, `timeout_ns` capped at 200 ms -> stores 1 at `err` and copies nothing; also skips when
+    /// `err` is already non-zero), then copies `len` bytes (multiple of 16, 16-byte aligned) from the mapped pinned host
+    /// address `src` into `dst` with 128-bit loads over PCIe: no copy-engine op on the compute stream. Addresses must come from
+    /// `pyre_host_pinned`. Design after Strata's copy_rows_from_mapped (github.com/Niko1221/Strata, MIT); reimplemented.
+    #[allow(unused_variables, clippy::too_many_arguments)]
+    fn pyre_wait_copy_from_mapped(&mut self, stream_id: StreamId, flag: usize, target: u32, timeout_ns: u64, err: usize, src: usize, len: usize, dst: BufferBinding) -> Result<(), ServerError> {
+        Err(ServerError::graph_state("pyre_wait_copy_from_mapped: unsupported backend"))
+    }
+
+    /// pyre (zero-copy D2H + doorbell): enqueue a one-block kernel that copies `len` bytes (multiple of 4; `dst` 16-byte aligned)
+    /// of `src` into the mapped pinned host address `dst`, then (when `flag` != 0) fences system-wide and stores `value` to the
+    /// mapped u32 at `flag`. The host polls `flag` (bounded) instead of a stream sync + D2H copy.
+    #[allow(unused_variables)]
+    fn pyre_copy_to_mapped(&mut self, stream_id: StreamId, src: BufferBinding, len: usize, dst: usize, flag: usize, value: u32) -> Result<(), ServerError> {
+        Err(ServerError::graph_state("pyre_copy_to_mapped: unsupported backend"))
+    }
+
     #[allow(unused_variables)]
     fn sync_collective(&mut self, stream_id: StreamId) -> Result<(), ServerError> {
         Err(ServerError::no_device_transport(Collective::SyncCollective))

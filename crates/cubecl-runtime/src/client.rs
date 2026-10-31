@@ -1550,6 +1550,32 @@ impl Client {
         });
     }
 
+    /// pyre (zero-copy): bounded wait on a mapped host flag + copy of mapped pinned host bytes into `dst` by a kernel
+    /// (see `Server::pyre_wait_copy_from_mapped`). Non-blocking. `flag` = 0: no wait.
+    ///
+    /// # Safety
+    /// `flag`/`err`/`src` must be `pyre_host_pinned` addresses valid for the life of the process; `src` must not be rewritten
+    /// until the kernel has run.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn pyre_wait_copy_from_mapped(&self, flag: usize, target: u32, timeout_ns: u64, err: usize, src: usize, len: usize, dst: &Handle) -> Result<(), ServerError> {
+        let stream_id = self.stream_id();
+        let b = dst.clone().binding();
+        self.expect_local(&b);
+        self.device.submit_blocking(move |server| server.pyre_wait_copy_from_mapped(stream_id, flag, target, timeout_ns, err, src, len, b)).unwrap_or_resume()
+    }
+
+    /// pyre (zero-copy): copy `len` bytes of `src` into mapped pinned host memory `dst` by a kernel, then store `value`
+    /// to the mapped doorbell `flag` (see `Server::pyre_copy_to_mapped`). Returns once enqueued (validated); the host polls `flag`.
+    ///
+    /// # Safety
+    /// `dst`/`flag` must be `pyre_host_pinned` addresses valid for the life of the process.
+    pub unsafe fn pyre_copy_to_mapped(&self, src: &Handle, len: usize, dst: usize, flag: usize, value: u32) -> Result<(), ServerError> {
+        let stream_id = self.stream_id();
+        let b = src.clone().binding();
+        self.expect_local(&b);
+        self.device.submit_blocking(move |server| server.pyre_copy_to_mapped(stream_id, b, len, dst, flag, value)).unwrap_or_resume()
+    }
+
     /// pyre: hand the queued commands to the device thread without waiting for them to run
     /// (a non-blocking [lush](Self::flush): the device thread launches them in order).
     pub fn flush_queue(&self) {

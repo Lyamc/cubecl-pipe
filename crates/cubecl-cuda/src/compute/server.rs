@@ -732,6 +732,80 @@ impl ServerCommunication for CudaServer {
         Ok(())
     }
 
+    fn pyre_wait_copy_from_mapped(&mut self, stream_id: StreamId, flag: usize, target: u32, timeout_ns: u64, err: usize, src: usize, len: usize, dst: BufferBinding) -> Result<(), ServerError> {
+        // Zero-copy, design after Strata's copy_rows_from_mapped (github.com/Niko1221/Strata, MIT); reimplemented.
+        const SRC: &str = r#"extern "C" __global__ void pyre_wcfm(const volatile unsigned int* f, unsigned int target, unsigned long long tmo, volatile unsigned int* err, const uint4* src, uint4* dst, unsigned long long n16) {
+  __shared__ int ok;
+  if (threadIdx.x == 0) {
+    int good = (*err == 0u);
+    if (good && f) {
+      unsigned long long t0, t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+      unsigned int ns = 64;
+      while (*f < target) {
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        if (t - t0 > tmo) { *err = 1u; __threadfence_system(); good = 0; break; }
+        if (*err != 0u) { good = 0; break; }
+        __nanosleep(ns); if (ns < 8192u) ns <<= 1;
+      }
+    }
+    ok = good;
+  }
+  __syncthreads();
+  if (!ok) return;
+  for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; i < n16; i += (unsigned long long)gridDim.x * blockDim.x) {
+    uint4 v; asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(src + i));
+    dst[i] = v;
+  }
+}"#;
+        static FUNC: std::sync::OnceLock<Result<usize, String>> = std::sync::OnceLock::new();
+        self.unsafe_set_current();
+        let f = pyre_raw_fn(&FUNC, SRC, "pyre_wcfm")?;
+        if len % 16 != 0 || src % 16 != 0 { return Err(ServerError::graph_state(format!("pyre_wait_copy_from_mapped: len {len} / src not 16-byte aligned"))); }
+        let mut command = self.command(stream_id, [&dst].into_iter())?;
+        let res = command.resource(dst.clone())?;
+        if (len as u64) > res.size || res.ptr % 16 != 0 { return Err(ServerError::graph_state(format!("pyre_wait_copy_from_mapped: {len} bytes into a {}-byte / unaligned buffer", res.size))); }
+        let stream = command.stream().sys;
+        drop(command);
+        let mut df = if flag != 0 { pyre_dev_ptr(flag)? } else { 0 };
+        let (mut t, mut tmo, mut de, mut ds, mut dd, mut n16) = (target, timeout_ns.min(200_000_000), pyre_dev_ptr(err)?, pyre_dev_ptr(src)?, res.ptr, (len / 16) as u64);
+        let blocks = ((n16 as u32).div_ceil(256)).clamp(1, 56);
+        let mut params: [*mut core::ffi::c_void; 7] = [&mut df as *mut _ as _, &mut t as *mut _ as _, &mut tmo as *mut _ as _, &mut de as *mut _ as _, &mut ds as *mut _ as _, &mut dd as *mut _ as _, &mut n16 as *mut _ as _];
+        // SAFETY: args match the kernel signature, valid stream, mapped host addresses / live device range checked above.
+        let r = unsafe { cudarc::driver::sys::cuLaunchKernel(f, blocks, 1, 1, 256, 1, 1, 0, stream, params.as_mut_ptr(), core::ptr::null_mut()) };
+        if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS { return Err(ServerError::graph_state(format!("cuLaunchKernel(pyre_wcfm) {r:?}"))); }
+        Ok(())
+    }
+
+    fn pyre_copy_to_mapped(&mut self, stream_id: StreamId, src: BufferBinding, len: usize, dst: usize, flag: usize, value: u32) -> Result<(), ServerError> {
+        // Zero-copy readback + doorbell, design after Strata's mapped routing doorbell (github.com/Niko1221/Strata, MIT); reimplemented.
+        const SRC: &str = r#"extern "C" __global__ void pyre_ctm(const uint4* src, uint4* dst, unsigned long long n16, volatile unsigned int* f, unsigned int val, unsigned int tail) {
+  if (threadIdx.x < tail) { ((volatile unsigned int*)(dst + n16))[threadIdx.x] = ((const unsigned int*)(src + n16))[threadIdx.x]; }
+  for (unsigned long long i = threadIdx.x; i < n16; i += blockDim.x) {
+    uint4 v = src[i];
+    asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" :: "l"(dst + i), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
+  }
+  __threadfence_system();
+  __syncthreads();
+  if (threadIdx.x == 0 && f) { __threadfence_system(); *f = val; __threadfence_system(); }
+}"#;
+        static FUNC: std::sync::OnceLock<Result<usize, String>> = std::sync::OnceLock::new();
+        self.unsafe_set_current();
+        let f = pyre_raw_fn(&FUNC, SRC, "pyre_ctm")?;
+        if len % 4 != 0 || dst % 16 != 0 { return Err(ServerError::graph_state(format!("pyre_copy_to_mapped: len {len} not a multiple of 4 / dst not 16-byte aligned"))); }
+        let mut command = self.command(stream_id, [&src].into_iter())?;
+        let res = command.resource(src.clone())?;
+        if (len as u64) > res.size || res.ptr % 16 != 0 { return Err(ServerError::graph_state(format!("pyre_copy_to_mapped: {len} bytes from a {}-byte / unaligned buffer", res.size))); }
+        let stream = command.stream().sys;
+        drop(command);
+        let (mut ds, mut dd, mut n16, mut v, mut tail) = (res.ptr, pyre_dev_ptr(dst)?, (len / 16) as u64, value, ((len % 16) / 4) as u32);
+        let mut df = if flag != 0 { pyre_dev_ptr(flag)? } else { 0 };
+        let mut params: [*mut core::ffi::c_void; 6] = [&mut ds as *mut _ as _, &mut dd as *mut _ as _, &mut n16 as *mut _ as _, &mut df as *mut _ as _, &mut v as *mut _ as _, &mut tail as *mut _ as _];
+        // SAFETY: one block of 1024 threads, args match the kernel signature, valid stream, ranges checked above.
+        let r = unsafe { cudarc::driver::sys::cuLaunchKernel(f, 1, 1, 1, 1024, 1, 1, 0, stream, params.as_mut_ptr(), core::ptr::null_mut()) };
+        if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS { return Err(ServerError::graph_state(format!("cuLaunchKernel(pyre_ctm) {r:?}"))); }
+        Ok(())
+    }
+
     fn sync_collective(&mut self, stream_id: StreamId) -> Result<(), ServerError> {
         let mut command = self.command_no_inputs(stream_id)?;
         let stream = command.stream().sys;
@@ -1689,4 +1763,32 @@ impl ServerStorage for CudaServer {
         let mut command = self.command(stream_id, [&binding].into_iter())?;
         Ok(command.managed_resource(binding)?)
     }
+}
+
+/// pyre: NVRTC-compile `src` once (compute_75) and return `name` (module kept for the process lifetime).
+fn pyre_raw_fn(cell: &'static std::sync::OnceLock<Result<usize, String>>, src: &str, name: &str) -> Result<cudarc::driver::sys::CUfunction, ServerError> {
+    let r = cell.get_or_init(|| {
+        let opts = cudarc::nvrtc::CompileOptions { arch: Some("compute_75"), ..Default::default() };
+        let ptx = cudarc::nvrtc::compile_ptx_with_opts(src, opts).map_err(|e| format!("nvrtc: {e:?}"))?;
+        let s = std::ffi::CString::new(ptx.to_src()).map_err(|e| format!("{e}"))?;
+        let mut m: cudarc::driver::sys::CUmodule = core::ptr::null_mut();
+        // SAFETY: NUL-terminated PTX text in the current context.
+        let r = unsafe { cudarc::driver::sys::cuModuleLoadData(&mut m, s.as_ptr() as *const core::ffi::c_void) };
+        if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS { return Err(format!("cuModuleLoadData {r:?}")); }
+        let mut f: cudarc::driver::sys::CUfunction = core::ptr::null_mut();
+        let n = std::ffi::CString::new(name).map_err(|e| format!("{e}"))?;
+        let r = unsafe { cudarc::driver::sys::cuModuleGetFunction(&mut f, m, n.as_ptr()) };
+        if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS { return Err(format!("cuModuleGetFunction {r:?}")); }
+        Ok(f as usize)
+    });
+    match r { Ok(f) => Ok(*f as cudarc::driver::sys::CUfunction), Err(e) => Err(ServerError::graph_state(e.clone())) }
+}
+
+/// pyre: device address of a DEVICEMAP pinned host address (pyre_host_pinned).
+fn pyre_dev_ptr(h: usize) -> Result<u64, ServerError> {
+    let mut d: cudarc::driver::sys::CUdeviceptr = 0;
+    // SAFETY: `h` lies in a DEVICEMAP pinned allocation (pyre_host_pinned); the driver rejects anything else.
+    let r = unsafe { cudarc::driver::sys::cuMemHostGetDevicePointer_v2(&mut d, h as *mut core::ffi::c_void, 0) };
+    if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS { return Err(ServerError::graph_state(format!("cuMemHostGetDevicePointer {r:?}"))); }
+    Ok(d)
 }
