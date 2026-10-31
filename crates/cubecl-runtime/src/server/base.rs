@@ -1066,6 +1066,23 @@ pub trait ServerCommunication {
         Err(ServerError::graph_state("pyre_copy_to_mapped: unsupported backend"))
     }
 
+    /// pyre (zero-copy H2D, per-chunk): like `pyre_wait_copy_from_mapped` for `nslot` rows of `row` bytes (row stride `row`)
+    /// split into column chunks of `chunk` bytes (both multiples of 16): block b waits BOUNDED until the mapped u32
+    /// `cflags + 64 * b` >= `target` OR the u32 at `flag` >= `target` (__nanosleep <= 1 us, `timeout_ns` capped at 200 ms ->
+    /// stores 1 at `err`; skips when `err` is already set), then copies chunk b of every row. Lets the device pull the rows
+    /// a CPU pool has finished while it is still writing the rest. Addresses from `pyre_host_pinned`.
+    #[allow(unused_variables, clippy::too_many_arguments)]
+    fn pyre_wait_copy_chunks(&mut self, stream_id: StreamId, flag: usize, cflags: usize, target: u32, timeout_ns: u64, err: usize, src: usize, nslot: usize, row: usize, chunk: usize, dst: BufferBinding) -> Result<(), ServerError> {
+        Err(ServerError::graph_state("pyre_wait_copy_chunks: unsupported backend"))
+    }
+
+    /// pyre (measurement): enqueue a one-thread kernel that stores the device %globaltimer (ns) as a u64 to the mapped
+    /// pinned host address `dst` (8-byte aligned, from `pyre_host_pinned`) and fences system-wide. Stream-ordered.
+    #[allow(unused_variables)]
+    fn pyre_stamp(&mut self, stream_id: StreamId, dst: usize) -> Result<(), ServerError> {
+        Err(ServerError::graph_state("pyre_stamp: unsupported backend"))
+    }
+
     #[allow(unused_variables)]
     fn sync_collective(&mut self, stream_id: StreamId) -> Result<(), ServerError> {
         Err(ServerError::no_device_transport(Collective::SyncCollective))

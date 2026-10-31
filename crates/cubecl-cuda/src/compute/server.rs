@@ -806,6 +806,73 @@ impl ServerCommunication for CudaServer {
         Ok(())
     }
 
+    fn pyre_wait_copy_chunks(&mut self, stream_id: StreamId, flag: usize, cflags: usize, target: u32, timeout_ns: u64, err: usize, src: usize, nslot: usize, row: usize, chunk: usize, dst: BufferBinding) -> Result<(), ServerError> {
+        // Per-chunk variant of pyre_wcfm (zero-copy design after Strata's copy_rows_from_mapped, github.com/Niko1221/Strata, MIT; reimplemented).
+        const SRC: &str = r#"extern "C" __global__ void pyre_wcfc(const volatile unsigned int* f, const volatile unsigned int* cf, unsigned int target, unsigned long long tmo, volatile unsigned int* err, const uint4* src, uint4* dst, unsigned int nslot, unsigned int r16, unsigned int c16) {
+  __shared__ int ok;
+  unsigned int b = blockIdx.x;
+  if (threadIdx.x == 0) {
+    int good = (*err == 0u);
+    if (good) {
+      unsigned long long t0, t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+      unsigned int ns = 32;
+      while (cf[b * 16u] < target && *f < target) {
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        if (t - t0 > tmo) { *err = 1u; __threadfence_system(); good = 0; break; }
+        if (*err != 0u) { good = 0; break; }
+        __nanosleep(ns); if (ns < 1024u) ns <<= 1;
+      }
+    }
+    ok = good;
+  }
+  __syncthreads();
+  if (!ok) return;
+  unsigned int c0 = b * c16, c1 = min(c0 + c16, r16), w = c1 - c0;
+  for (unsigned int i = threadIdx.x; i < nslot * w; i += blockDim.x) {
+    unsigned int s = i / w, c = c0 + i % w; unsigned long long o = (unsigned long long)s * r16 + c;
+    uint4 v; asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(src + o));
+    dst[o] = v;
+  }
+}"#;
+        static FUNC: std::sync::OnceLock<Result<usize, String>> = std::sync::OnceLock::new();
+        self.unsafe_set_current();
+        let f = pyre_raw_fn(&FUNC, SRC, "pyre_wcfc")?;
+        if row % 16 != 0 || chunk % 16 != 0 || chunk == 0 || src % 16 != 0 || cflags % 64 != 0 { return Err(ServerError::graph_state(format!("pyre_wait_copy_chunks: row {row} / chunk {chunk} / src / cflags misaligned"))); }
+        let len = nslot * row;
+        let mut command = self.command(stream_id, [&dst].into_iter())?;
+        let res = command.resource(dst.clone())?;
+        if (len as u64) > res.size || res.ptr % 16 != 0 { return Err(ServerError::graph_state(format!("pyre_wait_copy_chunks: {len} bytes into a {}-byte / unaligned buffer", res.size))); }
+        let stream = command.stream().sys;
+        drop(command);
+        let nch = row.div_ceil(chunk) as u32;
+        let (mut df, mut dc, mut t, mut tmo, mut de, mut ds, mut dd) = (pyre_dev_ptr(flag)?, pyre_dev_ptr(cflags)?, target, timeout_ns.min(200_000_000), pyre_dev_ptr(err)?, pyre_dev_ptr(src)?, res.ptr);
+        let (mut ns, mut r16, mut c16) = (nslot as u32, (row / 16) as u32, (chunk / 16) as u32);
+        let mut params: [*mut core::ffi::c_void; 10] = [&mut df as *mut _ as _, &mut dc as *mut _ as _, &mut t as *mut _ as _, &mut tmo as *mut _ as _, &mut de as *mut _ as _, &mut ds as *mut _ as _, &mut dd as *mut _ as _, &mut ns as *mut _ as _, &mut r16 as *mut _ as _, &mut c16 as *mut _ as _];
+        // SAFETY: one block per chunk, args match the kernel signature, valid stream, mapped host addresses / live device range checked above.
+        let r = unsafe { cudarc::driver::sys::cuLaunchKernel(f, nch, 1, 1, 128, 1, 1, 0, stream, params.as_mut_ptr(), core::ptr::null_mut()) };
+        if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS { return Err(ServerError::graph_state(format!("cuLaunchKernel(pyre_wcfc) {r:?}"))); }
+        Ok(())
+    }
+
+    fn pyre_stamp(&mut self, stream_id: StreamId, dst: usize) -> Result<(), ServerError> {
+        const SRC: &str = r#"extern "C" __global__ void pyre_stamp(volatile unsigned long long* d) {
+  unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); *d = t; __threadfence_system();
+}"#;
+        static FUNC: std::sync::OnceLock<Result<usize, String>> = std::sync::OnceLock::new();
+        self.unsafe_set_current();
+        let f = pyre_raw_fn(&FUNC, SRC, "pyre_stamp")?;
+        if dst % 8 != 0 { return Err(ServerError::graph_state("pyre_stamp: dst not 8-byte aligned")); }
+        let mut command = self.command_no_inputs(stream_id)?;
+        let stream = command.stream().sys;
+        drop(command);
+        let mut dd = pyre_dev_ptr(dst)?;
+        let mut params: [*mut core::ffi::c_void; 1] = [&mut dd as *mut _ as _];
+        // SAFETY: one thread, args match the kernel signature, valid stream, mapped host address.
+        let r = unsafe { cudarc::driver::sys::cuLaunchKernel(f, 1, 1, 1, 1, 1, 1, 0, stream, params.as_mut_ptr(), core::ptr::null_mut()) };
+        if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS { return Err(ServerError::graph_state(format!("cuLaunchKernel(pyre_stamp) {r:?}"))); }
+        Ok(())
+    }
+
     fn sync_collective(&mut self, stream_id: StreamId) -> Result<(), ServerError> {
         let mut command = self.command_no_inputs(stream_id)?;
         let stream = command.stream().sys;

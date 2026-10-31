@@ -1596,6 +1596,37 @@ impl Client {
         self.device.submit_blocking(move |server| server.pyre_copy_to_mapped(stream_id, b, len, dst, flag, value)).unwrap_or_resume()
     }
 
+    /// pyre (zero-copy, per-chunk): `Server::pyre_wait_copy_chunks` submitted without a blocking round trip; a launch/
+    /// validation error is logged and stores 1 to the u32 at `fail`.
+    ///
+    /// # Safety
+    /// As `pyre_wait_copy_from_mapped_async`; `cflags` must be a 64-byte aligned `pyre_host_pinned` range of 64 bytes per chunk.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn pyre_wait_copy_chunks_async(&self, flag: usize, cflags: usize, target: u32, timeout_ns: u64, err: usize, src: usize, nslot: usize, row: usize, chunk: usize, dst: &Handle, fail: usize) {
+        let stream_id = self.stream_id();
+        let b = dst.clone().binding();
+        self.expect_local(&b);
+        self.device.submit(move |server| {
+            if let Err(e) = server.pyre_wait_copy_chunks(stream_id, flag, cflags, target, timeout_ns, err, src, nslot, row, chunk, b) {
+                log::error!("pyre_wait_copy_chunks_async: {e}");
+                // SAFETY: caller guarantees `fail` is a live aligned u32.
+                unsafe { core::ptr::write_volatile(fail as *mut u32, 1) };
+            }
+        });
+    }
+
+    /// pyre (measurement): enqueue a stream-ordered store of the device %globaltimer (u64 ns) to mapped pinned `dst`
+    /// (see `Server::pyre_stamp`). Non-blocking; errors are logged.
+    ///
+    /// # Safety
+    /// `dst` must be an 8-byte aligned `pyre_host_pinned` address valid for the life of the process.
+    pub unsafe fn pyre_stamp(&self, dst: usize) {
+        let stream_id = self.stream_id();
+        self.device.submit(move |server| {
+            if let Err(e) = server.pyre_stamp(stream_id, dst) { log::error!("pyre_stamp: {e}"); }
+        });
+    }
+
     /// pyre: hand the queued commands to the device thread without waiting for them to run
     /// (a non-blocking [lush](Self::flush): the device thread launches them in order).
     pub fn flush_queue(&self) {
