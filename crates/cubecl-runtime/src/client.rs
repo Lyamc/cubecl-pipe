@@ -1524,6 +1524,26 @@ impl Client {
         self.device.submit_blocking(move |server| server.pyre_host_pinned(bytes)).unwrap_or_resume()
     }
 
+    /// pyre (PYRE_QN_XZS): free a `pyre_host_pinned` allocation (see `Server::pyre_host_free`). Blocking.
+    ///
+    /// # Safety
+    /// No queued or running kernel may still read `host`; sync the streams that used it first.
+    pub unsafe fn pyre_host_free(&self, host: usize) -> Result<(), ServerError> {
+        self.device.submit_blocking(move |server| server.pyre_host_free(host)).unwrap_or_resume()
+    }
+
+    /// pyre (PYRE_QN_XZS): alias the device range of `placeholder` to the mapped pinned host range `host..host+len`
+    /// for every later kernel launch (see `Server::pyre_alias_mapped`). Blocking.
+    ///
+    /// # Safety
+    /// `host` must be a `pyre_host_pinned` range of >= `len` bytes; `placeholder` must stay alive while aliased; kernels
+    /// given `placeholder` must stay within `len` bytes.
+    pub unsafe fn pyre_alias_mapped(&self, placeholder: &Handle, host: usize, len: usize) -> Result<(), ServerError> {
+        let stream_id = self.stream_id();
+        let b = placeholder.clone().binding();
+        self.device.submit_blocking(move |server| server.pyre_alias_mapped(stream_id, b, host, len)).unwrap_or_resume()
+    }
+
     /// pyre (PYRE_QN_PIPE=2): enqueue the bounded device wait on a mapped host flag (see `Server::pyre_wait_flag`). Non-blocking.
     ///
     /// # Safety
@@ -1594,6 +1614,25 @@ impl Client {
         let b = src.clone().binding();
         self.expect_local(&b);
         self.device.submit_blocking(move |server| server.pyre_copy_to_mapped(stream_id, b, len, dst, flag, value)).unwrap_or_resume()
+    }
+
+    /// pyre (PYRE_QN_XZS): `pyre_copy_to_mapped` without the blocking round trip to the server: returns once submitted.
+    /// On a launch/validation error it logs and stores 1 to the u32 at `fail` (the doorbell is then never written, so a
+    /// bounded device wait on it times out and sets its own err word).
+    ///
+    /// # Safety
+    /// As `pyre_copy_to_mapped`; `fail` must point to a live, 4-byte aligned u32 for the life of the process.
+    pub unsafe fn pyre_copy_to_mapped_async(&self, src: &Handle, len: usize, dst: usize, flag: usize, value: u32, fail: usize) {
+        let stream_id = self.stream_id();
+        let b = src.clone().binding();
+        self.expect_local(&b);
+        self.device.submit(move |server| {
+            if let Err(e) = server.pyre_copy_to_mapped(stream_id, b, len, dst, flag, value) {
+                log::error!("pyre_copy_to_mapped_async: {e}");
+                // SAFETY: caller guarantees `fail` is a live aligned u32.
+                unsafe { core::ptr::write_volatile(fail as *mut u32, 1) };
+            }
+        });
     }
 
     /// pyre (zero-copy, per-chunk): `Server::pyre_wait_copy_chunks` submitted without a blocking round trip; a launch/

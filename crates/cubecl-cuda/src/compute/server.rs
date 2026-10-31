@@ -658,6 +658,26 @@ impl ServerCommunication for CudaServer {
         Ok(p as usize)
     }
 
+    fn pyre_host_free(&mut self, host: usize) -> Result<(), ServerError> {
+        self.unsafe_set_current();
+        if let Ok(mut a) = PYRE_ALIAS.lock() { a.retain(|x| x.4 != host); PYRE_ALIAS_ON.store(!a.is_empty(), std::sync::atomic::Ordering::Release); }
+        // SAFETY: `host` came from cuMemHostAlloc (pyre_host_pinned); the caller synced every stream that read it.
+        let r = unsafe { cudarc::driver::sys::cuMemFreeHost(host as *mut core::ffi::c_void) };
+        if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS { return Err(ServerError::graph_state(format!("cuMemFreeHost {r:?}"))); }
+        Ok(())
+    }
+
+    fn pyre_alias_mapped(&mut self, stream_id: StreamId, placeholder: BufferBinding, host: usize, len: usize) -> Result<(), ServerError> {
+        let (base, size) = { let mut command = self.command(stream_id, [&placeholder].into_iter())?; let res = command.resource(placeholder.clone())?; (res.ptr, res.size) };
+        if len == 0 { return Err(ServerError::graph_state("pyre_alias_mapped: empty range")); }
+        let dev = pyre_dev_ptr(host)?; let dev_end = pyre_dev_ptr(host + len - 1)?;
+        if dev_end != dev + len as u64 - 1 { return Err(ServerError::graph_state("pyre_alias_mapped: host range is not one contiguous mapped allocation")); }
+        let mut a = PYRE_ALIAS.lock().map_err(|_| ServerError::graph_state("pyre_alias_mapped: poisoned"))?;
+        if a.iter().any(|x| base < x.0 + x.1 && x.0 < base + size) { return Err(ServerError::graph_state("pyre_alias_mapped: placeholder already aliased")); }
+        a.push((base, size, dev, len as u64, host)); PYRE_ALIAS_ON.store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
     fn pyre_wait_flag(&mut self, stream_id: StreamId, flag: usize, target: u32, timeout_ns: u64, err: usize) -> Result<(), ServerError> {
         // Design after Strata's wait_flag_ge (github.com/Niko1221/Strata, MIT); reimplemented with a hard time bound.
         const SRC: &str = r#"extern "C" __global__ void pyre_wait_flag(volatile unsigned int* f, unsigned int target, unsigned long long tmo, volatile unsigned int* err) {
@@ -1363,10 +1383,18 @@ impl CudaServer {
         // Resolving is also where a discarded launch's deferred allocations get their
         // device backing, so this can fail on a device the measured plan does
         // not fit — reported, not panicked.
+        // pyre (PYRE_QN_XZS): device addresses substituted for aliased placeholders; boxed so the pointers stay put.
+        let mut pyre_alias_args: Vec<Box<u64>> = Vec::new();
+        let pyre_alias_on = PYRE_ALIAS_ON.load(std::sync::atomic::Ordering::Acquire);
         for resource in bindings.resources.into_iter() {
             match resource {
                 KernelResource::Buffer(binding) => {
                     let resource = command.resource(binding)?;
+                    if let Some(p) = if pyre_alias_on { pyre_alias_ptr(resource.ptr) } else { None } {
+                        pyre_alias_args.push(Box::new(p));
+                        resources.push(&mut **pyre_alias_args.last_mut().unwrap() as *mut u64 as *mut c_void);
+                        continue;
+                    }
                     resources.push(resource.binding);
                 }
                 KernelResource::TensorMap(TensorMapBinding { map, binding }) => {
@@ -1386,6 +1414,7 @@ impl CudaServer {
         resources.extend(info_const);
 
         command.kernel(&kernel_id, kernel, count, &mut resources)?;
+        drop(pyre_alias_args);
 
         Ok(())
     }
@@ -1849,6 +1878,14 @@ fn pyre_raw_fn(cell: &'static std::sync::OnceLock<Result<usize, String>>, src: &
         Ok(f as usize)
     });
     match r { Ok(f) => Ok(*f as cudarc::driver::sys::CUfunction), Err(e) => Err(ServerError::graph_state(e.clone())) }
+}
+
+/// pyre (PYRE_QN_XZS): aliases (placeholder device base, placeholder size, mapped host device base, host len, host address).
+static PYRE_ALIAS: std::sync::Mutex<Vec<(u64, u64, u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+static PYRE_ALIAS_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn pyre_alias_ptr(ptr: u64) -> Option<u64> {
+    let a = PYRE_ALIAS.lock().ok()?;
+    a.iter().find(|x| ptr >= x.0 && ptr < x.0 + x.1).map(|x| x.2 + (ptr - x.0))
 }
 
 /// pyre: device address of a DEVICEMAP pinned host address (pyre_host_pinned).

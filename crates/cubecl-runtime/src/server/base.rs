@@ -1029,6 +1029,21 @@ pub trait ServerCommunication {
         Err(ServerError::graph_state("pyre_host_pinned: unsupported backend"))
     }
 
+    /// pyre (PYRE_QN_XZS): free a `pyre_host_pinned` allocation (drops any alias registered on it first).
+    #[allow(unused_variables)]
+    fn pyre_host_free(&mut self, host: usize) -> Result<(), ServerError> {
+        Err(ServerError::graph_state("pyre_host_free: unsupported backend"))
+    }
+
+    /// pyre (PYRE_QN_XZS, zero-copy kernels): from now on every kernel launch whose buffer argument resolves inside the
+    /// device range of `placeholder` gets, instead, the device address of the mapped pinned host range `host` (same offset).
+    /// The kernels are unchanged and read the host bytes over PCIe; `placeholder` is a small real device buffer that only
+    /// keeps CubeCL's bookkeeping (streams, lifetimes) intact and must outlive the alias. Kernels must not index past `len`.
+    #[allow(unused_variables)]
+    fn pyre_alias_mapped(&mut self, stream_id: StreamId, placeholder: BufferBinding, host: usize, len: usize) -> Result<(), ServerError> {
+        Err(ServerError::graph_state("pyre_alias_mapped: unsupported backend"))
+    }
+
     /// pyre (PYRE_QN_PIPE=2): enqueue a one-thread kernel that waits, BOUNDED, until the u32 at the mapped
     /// host address `flag` is >= `target`: __nanosleep backoff (64 ns doubling to 8 us), gives up after
     /// `timeout_ns` of %globaltimer and then stores 1 to the mapped u32 at `err`. Both addresses must come from
